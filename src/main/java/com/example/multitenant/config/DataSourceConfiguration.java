@@ -3,21 +3,31 @@ package com.example.multitenant.config;
 import com.zaxxer.hikari.HikariDataSource;
 import java.util.EnumMap;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import javax.sql.DataSource;
-import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.init.DatabasePopulatorUtils;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.util.Assert;
+import org.springframework.util.StringUtils;
 
 @Configuration
+@EnableConfigurationProperties(MultitenancyProperties.class)
 public class DataSourceConfiguration {
 
-    private static final List<String> TENANTS = List.of("tenant1", "tenant2");
+    private final MultitenancyProperties multitenancyProperties;
+
+    public DataSourceConfiguration(MultitenancyProperties multitenancyProperties) {
+        this.multitenancyProperties = multitenancyProperties;
+    }
 
     @Bean
     public TenantConnectionRegistry tenantConnectionRegistry() {
@@ -27,53 +37,85 @@ public class DataSourceConfiguration {
     @Bean
     @Primary
     public DataSource dataSource(TenantConnectionRegistry registry) {
-        Map<Object, Object> dataSources = new HashMap<>();
-        for (String tenant : TENANTS) {
-            Map<DataSourceType, DataSource> perTenant = createTenantDataSources(tenant);
-            for (Map.Entry<DataSourceType, DataSource> entry : perTenant.entrySet()) {
-                dataSources.put(TenantConnectionKey.of(tenant, entry.getKey()), entry.getValue());
+        Map<String, MultitenancyProperties.TenantDataSourceProperties> tenants =
+                multitenancyProperties.getTenants();
+        Assert.state(!tenants.isEmpty(),
+                "At least one tenant must be configured under 'multitenancy.tenants'.");
+
+        Map<Object, Object> targetDataSources = new HashMap<>();
+        DataSource defaultDataSource = null;
+
+        for (Entry<String, MultitenancyProperties.TenantDataSourceProperties> entry : tenants.entrySet()) {
+            String tenantId = entry.getKey();
+            MultitenancyProperties.TenantDataSourceProperties tenantProperties = entry.getValue();
+
+            Map<DataSourceType, DataSource> perTenantDataSources =
+                    createTenantDataSources(tenantId, tenantProperties);
+            perTenantDataSources.forEach((type, dataSource) ->
+                    targetDataSources.put(TenantConnectionKey.of(tenantId, type), dataSource));
+
+            if (defaultDataSource == null) {
+                defaultDataSource = perTenantDataSources.get(DataSourceType.WRITE);
             }
         }
+
         TenantRoutingDataSource routingDataSource = new TenantRoutingDataSource(registry);
-        routingDataSource.setTargetDataSources(dataSources);
-        routingDataSource.setDefaultTargetDataSource(
-                dataSources.get(TenantConnectionKey.of(TENANTS.get(0), DataSourceType.WRITE)));
+        routingDataSource.setTargetDataSources(targetDataSources);
+        routingDataSource.setDefaultTargetDataSource(defaultDataSource);
         routingDataSource.setLenientFallback(false);
         routingDataSource.afterPropertiesSet();
         return routingDataSource;
     }
 
-    private Map<DataSourceType, DataSource> createTenantDataSources(String tenant) {
+    @Bean
+    public PlatformTransactionManager transactionManager(DataSource dataSource) {
+        return new DataSourceTransactionManager(dataSource);
+    }
+
+    private Map<DataSourceType, DataSource> createTenantDataSources(
+            String tenantId, MultitenancyProperties.TenantDataSourceProperties properties) {
         Map<DataSourceType, DataSource> map = new EnumMap<>(DataSourceType.class);
 
-        DataSource writeDataSource = createDataSource(tenant, DataSourceType.WRITE);
-        initializeSchema(writeDataSource);
+        DataSource writeDataSource = buildDataSource(tenantId, DataSourceType.WRITE, properties.getWrite(), false);
+        if (properties.isInitializeSchema()) {
+            initializeSchema(writeDataSource);
+        }
         map.put(DataSourceType.WRITE, writeDataSource);
 
-        DataSource readDataSource = createDataSource(tenant, DataSourceType.READ);
+        DataSource readDataSource;
+        if (isConfigured(properties.getRead())) {
+            readDataSource = buildDataSource(tenantId, DataSourceType.READ, properties.getRead(), true);
+        } else {
+            readDataSource = writeDataSource;
+        }
         map.put(DataSourceType.READ, readDataSource);
 
         return map;
     }
 
-    private DataSource createDataSource(String tenant, DataSourceType type) {
-        String url = "jdbc:h2:mem:%s;DB_CLOSE_DELAY=-1;MODE=LEGACY".formatted(tenant);
-        HikariDataSource dataSource = DataSourceBuilder.create()
+    private DataSource buildDataSource(String tenantId, DataSourceType type, DataSourceProperties properties,
+            boolean readOnly) {
+        HikariDataSource dataSource = properties.initializeDataSourceBuilder()
                 .type(HikariDataSource.class)
-                .driverClassName("org.h2.Driver")
-                .url(url)
-                .username("sa")
-                .password("")
                 .build();
-        dataSource.setPoolName("%s-%s-pool".formatted(tenant, type.name().toLowerCase()));
-        if (type == DataSourceType.READ) {
-            dataSource.setReadOnly(true);
-        }
+        dataSource.setPoolName("%s-%s-pool".formatted(tenantId, type.name().toLowerCase()));
+        dataSource.setReadOnly(readOnly);
         return dataSource;
     }
 
+    private boolean isConfigured(DataSourceProperties properties) {
+        if (properties == null) {
+            return false;
+        }
+        return StringUtils.hasText(properties.getUrl())
+                || StringUtils.hasText(properties.getJndiName())
+                || StringUtils.hasText(properties.getDriverClassName())
+                || StringUtils.hasText(properties.getUsername());
+    }
+
     private void initializeSchema(DataSource dataSource) {
-        ResourceDatabasePopulator populator = new ResourceDatabasePopulator(new ClassPathResource("schema.sql"));
+        ResourceDatabasePopulator populator =
+                new ResourceDatabasePopulator(new ClassPathResource("schema.sql"));
         DatabasePopulatorUtils.execute(populator, dataSource);
     }
 }

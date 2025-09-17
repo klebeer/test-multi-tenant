@@ -1,4 +1,8 @@
 package com.example.multitenant.customer;
 
-public record Customer(Long id, String name) {
+import org.springframework.data.annotation.Id;
+import org.springframework.data.relational.core.mapping.Table;
+
+@Table("CUSTOMERS")
+public record Customer(@Id Long id, String name) {
 }
